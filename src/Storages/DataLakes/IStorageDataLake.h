@@ -6,6 +6,9 @@
 
 #include <Storages/IStorage.h>
 #include <Common/logger_useful.h>
+#include <DataTypes/DataTypeString.h>
+#include <Storages/DataLakes/Metadata.h>
+#include <Storages/VirtualColumnUtils.h>
 #include <Storages/StorageFactory.h>
 #include <Formats/FormatFactory.h>
 #include <filesystem>
@@ -43,31 +46,73 @@ public:
         return Storage::getConfiguration(engine_args, local_context, /* get_format_from_file */false);
     }
 
-    Configuration updateConfigurationAndGetCopy(ContextPtr local_context) override
+    Configuration updateConfigurationAndGetCopy(ASTPtr query, ContextPtr local_context) override
     {
         std::lock_guard lock(configuration_update_mutex);
-        updateConfigurationImpl(local_context);
+        updateConfigurationImpl(query, local_context);
         return Storage::getConfiguration();
     }
 
     void updateConfiguration(ContextPtr local_context) override
     {
         std::lock_guard lock(configuration_update_mutex);
-        updateConfigurationImpl(local_context);
+        updateConfigurationImpl(std::nullopt, local_context);
     }
 
 private:
     static Configuration getConfigurationForDataRead(
-        const Configuration & base_configuration, ContextPtr local_context, const Strings & keys = {})
+        const Configuration & base_configuration, ContextPtr local_context, std::optional<ASTPtr> query = std::nullopt)
     {
         auto configuration{base_configuration};
         configuration.update(local_context);
         configuration.static_configuration = true;
 
-        if (keys.empty())
-            configuration.keys = getDataFiles(configuration, local_context);
-        else
-            configuration.keys = keys;
+        Metadata metadata = MetadataParser().getMetadata(configuration, local_context);
+
+        /// Create a virtual block with one row to construct filter
+        if (query && query)
+        {
+            Block virtual_header;
+            const NamesAndTypesList partitions = metadata.partitions;
+            for (const auto & p : partitions)
+            {
+                virtual_header.insert({p.type->createColumn(), p.type, p.name});
+            }
+            virtual_header.insert({ColumnString::create(), std::make_shared<DataTypeString>(), "_key"});
+
+            /// Append "idx" column as the filter result
+            //                virtual_header.insert({ColumnUInt64::create(), std::make_shared<DataTypeUInt64>(), "_idx"});
+            //
+            //                auto block = virtual_header.cloneEmpty();
+            //                addPathToVirtualColumns(block, fs::path(bucket) / keys.front(), 0);
+
+            ASTPtr filter_ast;
+            VirtualColumnUtils::prepareFilterBlockWithQuery(*query, local_context, virtual_header, filter_ast);
+
+            if (filter_ast)
+            {
+                Block block = virtual_header.cloneEmpty();
+                for (const auto & kv : metadata.key_with_partition_values)
+                {
+                    for (const auto & p : partitions)
+                    {
+                        block.getByName(p.name).column->assumeMutableRef().insert(kv.second->at(p.name));
+                    }
+                    block.getByName("_key").column->assumeMutableRef().insert(kv.first);
+                }
+
+                VirtualColumnUtils::filterBlockWithQuery(*query, virtual_header, local_context, filter_ast);
+                const auto & keys_col = typeid_cast<const ColumnString &>(*block.getByName("_key").column);
+
+                std::set<String> filtered_keys;
+
+                for (size_t i = 0; i < keys_col.size(); i++)
+                {
+                    filtered_keys.insert(keys_col.getDataAt(i).data);
+                }
+                configuration.keys = {filtered_keys.begin(), filtered_keys.end()};
+            }
+        }
 
         LOG_TRACE(
             &Poco::Logger::get("DataLake"),
@@ -78,20 +123,13 @@ private:
         return configuration;
     }
 
-    static Strings getDataFiles(const Configuration & configuration, ContextPtr local_context)
-    {
-        return MetadataParser().getFiles(configuration, local_context);
-    }
-
-    void updateConfigurationImpl(ContextPtr local_context)
+    void updateConfigurationImpl(std::optional<ASTPtr> query, ContextPtr local_context)
     {
         const bool updated = base_configuration.update(local_context);
-        auto new_keys = getDataFiles(base_configuration, local_context);
-
-        if (!updated && new_keys == Storage::getConfiguration().keys)
+        if (!updated)
             return;
 
-        Storage::useConfiguration(getConfigurationForDataRead(base_configuration, local_context, new_keys));
+        Storage::useConfiguration(getConfigurationForDataRead(base_configuration, local_context, query));
     }
 
     Configuration base_configuration;

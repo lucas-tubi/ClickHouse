@@ -4,6 +4,7 @@
 #include <set>
 
 #if USE_AWS_S3 && USE_PARQUET
+#include <DataTypes/DataTypeTuple.h>
 #include <Storages/DataLakes/S3MetadataReader.h>
 #include <Storages/StorageS3.h>
 #include <parquet/file_reader.h>
@@ -65,12 +66,13 @@ struct DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::Impl
      * An action changes one aspect of the table's state, for example, adding or removing a file.
      * Note: it is not a valid json, but a list of json's, so we read it in a while cycle.
      */
-    std::set<String> processMetadataFiles(const Configuration & configuration, ContextPtr context)
+    Metadata processMetadataFiles(const Configuration & configuration, ContextPtr context)
     {
-        std::set<String> result_files;
-        const auto checkpoint_version = getCheckpointIfExists(result_files, configuration, context);
+        Metadata::KeyWithPartitionValues keys;
+        NamesAndTypesList partitions;
+        const auto checkpoint_version = getCheckpointIfExists(keys, partitions, configuration, context);
 
-        if (checkpoint_version)
+        if (checkpoint_version >= 0)
         {
             auto current_version = checkpoint_version;
             while (true)
@@ -81,7 +83,7 @@ struct DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::Impl
                 if (!MetadataReadHelper::exists(file_path, configuration))
                     break;
 
-                processMetadataFile(file_path, result_files, configuration, context);
+                processMetadataFile(file_path, keys, configuration, context);
             }
 
             LOG_TRACE(
@@ -90,14 +92,14 @@ struct DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::Impl
         }
         else
         {
-            const auto keys = MetadataReadHelper::listFiles(
+            const auto delta_log_files = MetadataReadHelper::listFiles(
                 configuration, deltalake_metadata_directory, metadata_file_suffix);
 
-            for (const String & key : keys)
-                processMetadataFile(key, result_files, configuration, context);
+            for (const String & delta_log_file : delta_log_files)
+                processMetadataFile(delta_log_file, keys, configuration, context);
         }
 
-        return result_files;
+        return Metadata(keys, partitions);
     }
 
     /**
@@ -131,7 +133,7 @@ struct DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::Impl
      */
     void processMetadataFile(
         const String & key,
-        std::set<String> & result,
+        Metadata::KeyWithPartitionValues & result,
         const Configuration & configuration,
         ContextPtr context)
     {
@@ -157,7 +159,8 @@ struct DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::Impl
             if (json.has("add"))
             {
                 const auto path = json["add"]["path"].getString();
-                const auto [_, inserted] = result.insert(fs::path(configuration.getPath()) / path);
+//                const auto partition_values_json = json["add"]["partitionValues"];
+                const auto [_, inserted] = result.emplace(fs::path(configuration.getPath()) / path, std::map<String, String>());
                 if (!inserted)
                     throw Exception(ErrorCodes::INCORRECT_DATA, "File already exists {}", path);
             }
@@ -188,7 +191,7 @@ struct DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::Impl
     {
         const auto last_checkpoint_file = fs::path(configuration.getPath()) / deltalake_metadata_directory / "_last_checkpoint";
         if (!MetadataReadHelper::exists(last_checkpoint_file, configuration))
-            return 0;
+            return -1;
 
         String json_str;
         auto buf = MetadataReadHelper::createReadBuffer(last_checkpoint_file, context, configuration);
@@ -241,10 +244,10 @@ struct DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::Impl
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Arrow error: {}", _s.ToString()); \
         } while (false)
 
-    size_t getCheckpointIfExists(std::set<String> & result, const Configuration & configuration, ContextPtr context)
+    size_t getCheckpointIfExists(Metadata::KeyWithPartitionValues & result, NamesAndTypesList & partitions, const Configuration & configuration, ContextPtr context)
     {
         const auto version = readLastCheckpointIfExists(configuration, context);
-        if (!version)
+        if (version < 0)
             return 0;
 
         const auto checkpoint_filename = withPadding(version) + ".checkpoint.parquet";
@@ -262,6 +265,18 @@ struct DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::Impl
 
         /// Read only columns that we need.
         columns.filterColumns(NameSet{"add", "remove"});
+
+        const auto add_tuple_type = std::dynamic_pointer_cast<const DB::DataTypeTuple>(columns.tryGetByName("add")->type);
+        const auto _partVals = add_tuple_type ->getElement(add_tuple_type -> getPositionByName("partitionValues_parsed"));
+        const auto partVals = std::dynamic_pointer_cast<const DB::DataTypeTuple>(_partVals);
+        const auto partNames = partVals->getElementNames();
+        const auto partTypes = partVals->getElements();
+        for (size_t i = 0; i < partNames.size(); i ++) {
+            partitions.push_back(NameAndTypePair(partNames[i], partTypes[i]));
+        }
+
+        LOG_TRACE(log, "columns from checkpoint: {}", fmt::join(partitions.getNames(), ", "));
+
         Block header;
         for (const auto & column : columns)
             header.insert({column.type->createColumn(), column.type, column.name});
@@ -304,13 +319,21 @@ struct DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::Impl
         const auto * tuple_column = assert_cast<const ColumnTuple *>(res_columns[0].get());
         const auto & nullable_column = assert_cast<const ColumnNullable &>(tuple_column->getColumn(0));
         const auto & path_column = assert_cast<const ColumnString &>(nullable_column.getNestedColumn());
+
+        const auto & partition_values_map_column = assert_cast<const ColumnMap &>(tuple_column->getColumn(1));
         for (size_t i = 0; i < path_column.size(); ++i)
         {
+            const auto tuples = partition_values_map_column[i];
+            std::map<String, String> pv_map;
+            for (const auto & tuple: tuples.get<Map &>()) {
+                const auto t = tuple.get<Tuple &>();
+                pv_map.emplace(t[0].get<String>(),t[1].get<String>());
+            }
             const auto filename = String(path_column.getDataAt(i));
             if (filename.empty())
                 continue;
             LOG_TEST(log, "Adding {}", filename);
-            const auto [_, inserted] = result.insert(fs::path(configuration.getPath()) / filename);
+            const auto [_, inserted] = result.emplace(fs::path(configuration.getPath()) / filename, pv_map);
             if (!inserted)
                 throw Exception(ErrorCodes::INCORRECT_DATA, "File already exists {}", filename);
         }
@@ -328,14 +351,13 @@ DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::DeltaLakeMetadataPar
 }
 
 template <typename Configuration, typename MetadataReadHelper>
-Strings DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::getFiles(const Configuration & configuration, ContextPtr context)
+Metadata DeltaLakeMetadataParser<Configuration, MetadataReadHelper>::getMetadata(const Configuration & configuration, ContextPtr context)
 {
-    auto result = impl->processMetadataFiles(configuration, context);
-    return Strings(result.begin(), result.end());
+    return impl->processMetadataFiles(configuration, context);
 }
 
 template DeltaLakeMetadataParser<StorageS3::Configuration, S3DataLakeMetadataReadHelper>::DeltaLakeMetadataParser();
-template Strings DeltaLakeMetadataParser<StorageS3::Configuration, S3DataLakeMetadataReadHelper>::getFiles(
+template Metadata DeltaLakeMetadataParser<StorageS3::Configuration, S3DataLakeMetadataReadHelper>::getMetadata(
     const StorageS3::Configuration & configuration, ContextPtr);
 }
 

@@ -61,9 +61,7 @@ struct IcebergMetadataParser<Configuration, MetadataReadHelper>::Impl
         if (metadata_files.empty())
         {
             throw Exception(
-                ErrorCodes::FILE_DOESNT_EXIST,
-                "The metadata file for Iceberg table with path {} doesn't exist",
-                configuration.url.key);
+                ErrorCodes::FILE_DOESNT_EXIST, "The metadata file for Iceberg table with path {} doesn't exist", configuration.url.key);
         }
 
         /// Get the latest version of metadata file: v<V>.metadata.json
@@ -107,13 +105,13 @@ struct IcebergMetadataParser<Configuration, MetadataReadHelper>::Impl
      *     "metadata-log" : [ ]
      * }
      */
-    struct Metadata
+    struct IcebergMetadata
     {
         int format_version;
         String manifest_list;
         Strings manifest_files;
     };
-    Metadata processMetadataFile(const Configuration & configuration, ContextPtr context)
+    IcebergMetadata processMetadataFile(const Configuration & configuration, ContextPtr context)
     {
         const auto metadata_file_path = getMetadataFile(configuration);
         auto buf = MetadataReadHelper::createReadBuffer(metadata_file_path, context, configuration);
@@ -124,7 +122,7 @@ struct IcebergMetadataParser<Configuration, MetadataReadHelper>::Impl
         Poco::Dynamic::Var json = parser.parse(json_str);
         Poco::JSON::Object::Ptr object = json.extract<Poco::JSON::Object::Ptr>();
 
-        Metadata result;
+        IcebergMetadata result;
         result.format_version = object->getValue<int>("format-version");
 
         auto current_snapshot_id = object->getValue<Int64>("current-snapshot-id");
@@ -136,7 +134,8 @@ struct IcebergMetadataParser<Configuration, MetadataReadHelper>::Impl
             if (snapshot->getValue<Int64>("snapshot-id") == current_snapshot_id)
             {
                 const auto path = snapshot->getValue<String>("manifest-list");
-                result.manifest_list = std::filesystem::path(configuration.url.key) / metadata_directory / std::filesystem::path(path).filename();
+                result.manifest_list
+                    = std::filesystem::path(configuration.url.key) / metadata_directory / std::filesystem::path(path).filename();
                 break;
             }
         }
@@ -152,7 +151,7 @@ struct IcebergMetadataParser<Configuration, MetadataReadHelper>::Impl
      * │ /iceberg_data/db/table_name/metadata/c87bfec7-d36c-4075-ad04-600b6b0f2020-m0.avro │            5813 │                 0 │ 2819310504515118887 │                      1 │                         0 │                        0 │ []         │              100 │                   0 │                  0 │
      * └──────────────────────────────────────────────────────────────────────────────────────────────────────┴─────────────────┴───────────────────┴─────────────────────┴────────────────────────┴───────────────────────────┴──────────────────────────┴────────────┴──────────────────┴─────────────────────┴────────────────────┘
      */
-    void processManifestList(Metadata & metadata, const Configuration & configuration, ContextPtr context)
+    void processManifestList(IcebergMetadata & metadata, const Configuration & configuration, ContextPtr context)
     {
         static constexpr auto manifest_path = "manifest_path";
 
@@ -205,7 +204,7 @@ struct IcebergMetadataParser<Configuration, MetadataReadHelper>::Impl
      * │      1 │ 2252246380142525104 │ ('/iceberg_data/db/table_name/data/a=2/00000-1-c9535a00-2f4f-405c-bcfa-6d4f9f477235-00003.parquet','PARQUET',(2),1,631,67108864,[(1,46),(2,48)],[(1,1),(2,1)],[(1,0),(2,0)],[],[(1,'\0\0\0\0\0\0\0'),(2,'3')],[(1,'\0\0\0\0\0\0\0'),(2,'3')],NULL,[4],0) │
      * └────────┴─────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
      */
-    Strings getFilesForRead(const Metadata & metadata, const Configuration & configuration, ContextPtr context)
+    Strings getFilesForRead(const IcebergMetadata & metadata, const Configuration & configuration, ContextPtr context)
     {
         static constexpr auto manifest_path = "data_file";
 
@@ -223,7 +222,8 @@ struct IcebergMetadataParser<Configuration, MetadataReadHelper>::Impl
                 throw Exception(
                     ErrorCodes::BAD_ARGUMENTS,
                     "Unexpected number of columns {}. Expected at least {}",
-                    root_node->leaves(), expected_min_num);
+                    root_node->leaves(),
+                    expected_min_num);
             }
 
             avro::NodePtr data_file_node = root_node->leafAt(static_cast<int>(leaves_num) - 1);
@@ -267,10 +267,7 @@ struct IcebergMetadataParser<Configuration, MetadataReadHelper>::Impl
     }
 
     MutableColumns parseAvro(
-        avro::DataFileReaderBase & file_reader,
-        const DataTypePtr & data_type,
-        const String & field_name,
-        const FormatSettings & settings)
+        avro::DataFileReaderBase & file_reader, const DataTypePtr & data_type, const String & field_name, const FormatSettings & settings)
     {
         auto deserializer = std::make_unique<AvroDeserializer>(
             Block{{data_type->createColumn(), data_type, field_name}}, file_reader.dataSchema(), true, true, settings);
@@ -297,21 +294,22 @@ IcebergMetadataParser<Configuration, MetadataReadHelper>::IcebergMetadataParser(
 }
 
 template <typename Configuration, typename MetadataReadHelper>
-Strings IcebergMetadataParser<Configuration, MetadataReadHelper>::getFiles(const Configuration & configuration, ContextPtr context)
+Metadata IcebergMetadataParser<Configuration, MetadataReadHelper>::getMetadata(const Configuration & configuration, ContextPtr context)
 {
     auto metadata = impl->processMetadataFile(configuration, context);
 
     /// When table first created and does not have any data
     if (metadata.manifest_list.empty())
-        return {};
+        return Metadata({});
 
     impl->processManifestList(metadata, configuration, context);
-    return impl->getFilesForRead(metadata, configuration, context);
+    Strings result = impl->getFilesForRead(metadata, configuration, context);
+    return Metadata(result);
 }
 
 
 template IcebergMetadataParser<StorageS3::Configuration, S3DataLakeMetadataReadHelper>::IcebergMetadataParser();
-template Strings IcebergMetadataParser<StorageS3::Configuration, S3DataLakeMetadataReadHelper>::getFiles(const StorageS3::Configuration & configuration, ContextPtr);
+template Metadata IcebergMetadataParser<StorageS3::Configuration, S3DataLakeMetadataReadHelper>::getMetadata(const StorageS3::Configuration & configuration, ContextPtr);
 
 }
 

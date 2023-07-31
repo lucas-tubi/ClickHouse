@@ -78,7 +78,7 @@ add_subdirectory (Loggers)
 add_subdirectory (Formats)
 
 
-set(dbms_headers)
+set(dbms_headers Storages/DataLakes/Metadata.h)
 set(dbms_sources)
 
 add_headers_and_sources(clickhouse_common_io Common)

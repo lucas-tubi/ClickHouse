@@ -312,7 +312,7 @@ public:
         ContextPtr ctx);
 
 protected:
-    virtual Configuration updateConfigurationAndGetCopy(ContextPtr local_context);
+    virtual Configuration updateConfigurationAndGetCopy(ASTPtr query, ContextPtr local_context);
 
     virtual void updateConfiguration(ContextPtr local_context);
 

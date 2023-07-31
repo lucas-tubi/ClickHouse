@@ -1026,7 +1026,7 @@ Pipe StorageS3::read(
     size_t max_block_size,
     size_t num_streams)
 {
-    auto query_configuration = updateConfigurationAndGetCopy(local_context);
+    auto query_configuration = updateConfigurationAndGetCopy(query_info.query, local_context);
 
     if (partition_by && query_configuration.withWildcard())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Reading from a partitioned S3 storage is not implemented yet");
@@ -1094,7 +1094,7 @@ Pipe StorageS3::read(
 
 SinkToStoragePtr StorageS3::write(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context, bool /*async_insert*/)
 {
-    auto query_configuration = updateConfigurationAndGetCopy(local_context);
+    auto query_configuration = updateConfigurationAndGetCopy(query, local_context);
 
     auto sample_block = metadata_snapshot->getSampleBlock();
     auto chosen_compression_method = chooseCompressionMethod(query_configuration.keys.back(), query_configuration.compression_method);
@@ -1165,9 +1165,9 @@ SinkToStoragePtr StorageS3::write(const ASTPtr & query, const StorageMetadataPtr
     }
 }
 
-void StorageS3::truncate(const ASTPtr & /* query */, const StorageMetadataPtr &, ContextPtr local_context, TableExclusiveLockHolder &)
+void StorageS3::truncate(const ASTPtr & query, const StorageMetadataPtr &, ContextPtr local_context, TableExclusiveLockHolder &)
 {
-    auto query_configuration = updateConfigurationAndGetCopy(local_context);
+    auto query_configuration = updateConfigurationAndGetCopy(query, local_context);
 
     if (query_configuration.withGlobs())
     {
@@ -1202,7 +1202,7 @@ void StorageS3::truncate(const ASTPtr & /* query */, const StorageMetadataPtr &,
         LOG_WARNING(&Poco::Logger::get("StorageS3"), "Failed to delete {}, error: {}", error.GetKey(), error.GetMessage());
 }
 
-StorageS3::Configuration StorageS3::updateConfigurationAndGetCopy(ContextPtr local_context)
+StorageS3::Configuration StorageS3::updateConfigurationAndGetCopy(const ASTPtr /* query */, ContextPtr local_context)
 {
     std::lock_guard lock(configuration_update_mutex);
     configuration.update(local_context);

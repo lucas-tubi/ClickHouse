@@ -2,6 +2,7 @@
 
 #include <Interpreters/Context_fwd.h>
 #include <Core/Types.h>
+#include <Storages/DataLakes/Metadata.h>
 
 namespace DB
 {
@@ -12,7 +13,7 @@ struct DeltaLakeMetadataParser
 public:
     DeltaLakeMetadataParser<Configuration, MetadataReadHelper>();
 
-    Strings getFiles(const Configuration & configuration, ContextPtr context);
+    Metadata getMetadata(const Configuration & configuration, ContextPtr context);
 
 private:
     struct Impl;
